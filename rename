@@ -1,0 +1,172 @@
+// rename.cpp - Fusion infrared tracking + Socket control + Motor Control
+#include <iostream>
+#include <wiringPi.h>
+#include <thread>
+#include <chrono>
+#include <atomic>
+#include <cstring>
+#include <unistd.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+
+const int BUFSIZE = 512;
+const int IN1 = 1, IN2 = 4, IN3 = 5, IN4 = 6;
+const int LEFT = 27, RIGHT = 26, BLEFT = 29, BRIGHT = 28;
+
+class Motor {
+public:
+    Motor() {
+        pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+        pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+        stop();
+    }
+
+    void forward() {
+        digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+        digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+        std::cout << "forward\n";
+    }
+
+    void back() {
+        digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+        digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+        std::cout << "back\n";
+    }
+
+    void left() {
+        digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+        digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+        std::cout << "left\n";
+    }
+
+    void right() {
+        digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+        digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+        std::cout << "right\n";
+    }
+
+    void stop() {
+        digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+        digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+        std::cout << "stop\n";
+    }
+};
+
+void infraredThread(std::atomic<bool>& running, Motor& motor) {
+    pinMode(LEFT, INPUT); pinMode(RIGHT, INPUT);
+    pinMode(BLEFT, INPUT); pinMode(BRIGHT, INPUT);
+    while (running) {
+        int l = digitalRead(LEFT);
+        int r = digitalRead(RIGHT);
+        int bl = digitalRead(BLEFT);
+        int br = digitalRead(BRIGHT);
+
+        if (bl == LOW || br == LOW) {
+            motor.stop();
+            std::cout << "AVOID\n";
+        } else if (l == LOW && r == LOW) {
+            motor.forward();
+        } else if (l == HIGH && r == LOW) {
+            motor.left();
+        } else if (r == HIGH && l == LOW) {
+            motor.right();
+        } else {
+            motor.stop();
+        }
+        delay(100);
+    }
+}
+
+void socketThread(std::atomic<bool>& running, Motor& motor, int port) {
+    int listenfd = socket(PF_INET, SOCK_STREAM, 0);
+    if (listenfd < 0) return;
+
+    sockaddr_in serv_addr{};
+    serv_addr.sin_family = AF_INET;
+    serv_addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    serv_addr.sin_port = htons(port);
+
+    if (bind(listenfd, (sockaddr*)&serv_addr, sizeof(serv_addr)) < 0 || listen(listenfd, 128) < 0) {
+        close(listenfd);
+        return;
+    }
+
+    fd_set allset, rset;
+    FD_ZERO(&allset);
+    FD_SET(listenfd, &allset);
+    int maxfd = listenfd;
+
+    while (running) {
+        rset = allset;
+        timeval tv{0, 500000};
+        int n = select(maxfd + 1, &rset, nullptr, nullptr, &tv);
+        if (n <= 0) continue;
+
+        if (FD_ISSET(listenfd, &rset)) {
+            sockaddr_in cli_addr{};
+            socklen_t len = sizeof(cli_addr);
+            int connfd = accept(listenfd, (sockaddr*)&cli_addr, &len);
+            if (connfd >= 0) {
+                FD_SET(connfd, &allset);
+                if (connfd > maxfd) maxfd = connfd;
+                std::cout << "Client connected\n";
+            }
+        }
+
+        for (int fd = listenfd + 1; fd <= maxfd; ++fd) {
+            if (!FD_ISSET(fd, &rset)) continue;
+            char buf[BUFSIZE] = {0};
+            int z = read(fd, buf, BUFSIZE);
+            if (z <= 0) {
+                close(fd);
+                FD_CLR(fd, &allset);
+                continue;
+            }
+            if (buf[1] == 0x00) {
+                switch (buf[2]) {
+                    case 0x01: motor.forward(); break;
+                    case 0x02: motor.back(); break;
+                    case 0x03: motor.left(); break;
+                    case 0x04: motor.right(); break;
+                    case 0x00: default: motor.stop(); break;
+                }
+            }
+        }
+    }
+    close(listenfd);
+}
+
+int main(int argc, char* argv[]) {
+    if (wiringPiSetup() == -1) {
+        std::cerr << "WiringPi setup failed!\n";
+        return 1;
+    }
+
+    if (argc != 2) {
+        std::cerr << "Usage: ./rename <port>\n";
+        return 1;
+    }
+
+    int port = std::atoi(argv[1]);
+    if (port <= 0) {
+        std::cerr << "Invalid port\n";
+        return 1;
+    }
+
+    Motor motor;
+    std::atomic<bool> running{true};
+
+    std::thread ir(infraredThread, std::ref(running), std::ref(motor));
+    std::thread sock(socketThread, std::ref(running), std::ref(motor), port);
+
+    std::cout << "System running... Press Enter to exit.\n";
+    std::cin.get();
+
+    running = false;
+    ir.join();
+    sock.join();
+
+    return 0;
+}
